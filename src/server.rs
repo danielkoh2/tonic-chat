@@ -24,6 +24,7 @@ pub mod chat {
 }
 
 #[derive(Debug)]
+// global shared memory, map of username -> mpsc, (mpsc: multi-provider, single consumer channel)
 struct ChatState {
     peers: HashMap<String, mpsc::Sender<Message>>,
 }
@@ -37,6 +38,7 @@ impl ChatState {
 
     pub async fn broadcast(&self, message: &Message) {
         for (name, tx) in &self.peers {
+            // must use message.clone because multiple receivers exist
             match tx.send(message.clone()).await {
                 Ok(_) => {}
                 Err(_) => {
@@ -49,6 +51,8 @@ impl ChatState {
 
 #[derive(Debug)]
 struct ChatServer {
+    //gRPC server runs multiple concurrent requests
+    //each RPC call may run on different async tasks, so need share state across tasks.
     state: Arc<RwLock<ChatState>>,
 }
 
@@ -60,32 +64,51 @@ impl ChatServer {
 
 #[tonic::async_trait]
 impl ChatService for ChatServer {
+    //tonic requirement, Pin<Box<dyn Stream<Item = Result<Message, Status>>>>
     type ConnectToServerStream = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send + Sync + 'static>>;
 
+    // client sends username, server returns a streaming channel due to proto
     async fn connect_to_server(
         &self,
         request: Request<ConnectionRequest>
     ) -> Result<Response<Self::ConnectToServerStream>, Status> {
         let username = request.into_inner().username;
 
-        let (stream_tx, stream_rx) = mpsc::channel(1);
+        //Channel A, channel to receive internal messages.
         let (tx, mut rx) = mpsc::channel(1);
+        //Channel B, channel to send messages into gRPC stream
+        let (stream_tx, stream_rx) = mpsc::channel(1);
 
         {
+            //Modify HashMap
             self.state.write().await.peers.insert(username.clone(), tx);
         }
 
         println!("{} connected to the server.", username);
+        let join_message = Message {
+            username: "System".to_string(),
+            message: format!("{} joined this chat", username),
+        };
+        self.state.read().await.broadcast(&join_message).await;
 
         {
             let shared_clone = self.state.clone();
             tokio::spawn(async move {
+                // wait for messages from broadcast
                 while let Some(message) = rx.recv().await {
+                    // forward them into gRPC stream
                     match stream_tx.send(Ok(message)).await {
                         Ok(_) => {}
                         Err(_) => {
                             println!("Failed to send message to {}.", &username);
-                            shared_clone.write().await.peers.remove(&username);
+                            {
+                                shared_clone.write().await.peers.remove(&username);
+                            }
+                            let leave_message = Message {
+                                username: "System".to_string(),
+                                message: format!("{} left the chat", username),
+                            };
+                            shared_clone.read().await.broadcast(&leave_message).await;
                         }
                     }
                 }
